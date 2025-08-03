@@ -20,7 +20,9 @@ from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup, SoupStrainer
 import requests
 import browser_cookie3
-from tqdm import tqdm
+import ray
+from setuptools.command.build_ext import if_dl
+# from tqdm import tqdm
 
 USER_URL = 'https://bandcamp.com/{}'
 COLLECTION_POST_URL = 'https://bandcamp.com/api/fancollection/1/collection_items'
@@ -154,6 +156,7 @@ def main() -> int:
     parser.add_argument('--verbose', '-v', action='count', default = 0)
     args = parser.parse_args()
 
+    ray.init()
     if args.parallel_downloads < 1 or args.parallel_downloads > MAX_THREADS:
         parser.error('--parallel-downloads must be between 1 and 32.')
 
@@ -183,12 +186,24 @@ def main() -> int:
 
     if CONFIG['VERBOSE']: print(args)
     if CONFIG['FORCE']: print('WARNING: --force flag set, existing files will be overwritten.')
-    CONFIG['COOKIE_JAR'] = get_cookies()
 
-    links = get_download_links_for_user(args.username, args.include_hidden, CONFIG['SINCE'])
-    if CONFIG['VERBOSE']: print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
+    config = {
+        'FORMAT': CONFIG['FORMAT'],
+        'OUTPUT_DIR': CONFIG['OUTPUT_DIR'],
+        'FILENAME_FORMAT': CONFIG['FILENAME_FORMAT'],
+        # Avoid complex objects like tqdm
+        'MAX_URL_ATTEMPTS': CONFIG['MAX_URL_ATTEMPTS'],
+        'URL_RETRY_WAIT': CONFIG['URL_RETRY_WAIT'],
+        'POST_DOWNLOAD_WAIT': CONFIG['POST_DOWNLOAD_WAIT'],
+        'FORCE': CONFIG['FORCE'],
+        'DRY_RUN': CONFIG['DRY_RUN'],
+        'VERBOSE': CONFIG['VERBOSE'],
+        'SINCE': CONFIG['SINCE'],
+    }
+    links = get_download_links_for_user(get_cookies(), args.username, args.include_hidden, CONFIG['SINCE'])
+    if config['VERBOSE']: print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
     if not links:
-        if CONFIG['SINCE'] is None:
+        if config['SINCE'] is None:
             print('WARN: No album links found for user [{}]. Are you logged in and have you selected the correct browser to pull cookies from?'.format(args.username))
         else:
             print('WARN: No album links found for user [{}] since [{}]. Are you logged in and have you selected the correct browser to pull cookies from, and is the specified time old enough?'.format(args.username, args.download_since))
@@ -196,16 +211,12 @@ def main() -> int:
 
     print('Starting album downloads...')
     downloaded_zips = []
-    CONFIG['TQDM'] = tqdm(links, unit = 'album')
-    if args.parallel_downloads > 1:
-        with ThreadPoolExecutor(max_workers = args.parallel_downloads) as executor:
-            downloaded_zips = [file_path for file_path in list(executor.map(download_album, links)) if _is_zip(file_path)]
-    else:
-        for link in links:
-            file_path = download_album(link)
-            if _is_zip(file_path):
-                downloaded_zips.append(file_path)
-    CONFIG['TQDM'].close()
+    # CONFIG['TQDM'] = tqdm(links, unit = 'album')
+
+
+    futures = [download_album.remote( link, config) for link in links]
+    [downloaded_zips.append(file_path) for file_path in ray.get(futures) if file_path and _is_zip(file_path)]
+    # CONFIG['TQDM'].close()
     print(downloaded_zips)
     if args.extract:
         for zip in downloaded_zips:
@@ -228,7 +239,7 @@ def filter_by_purchase_time(items : [dict], _since : datetime.datetime) -> [dict
             good.append(item)
     return good
 
-def fetch_items(_url : str, _user_id : str, _last_token : str, _count : int, _since : datetime.datetime) -> [str]:
+def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count : int, _since : datetime.datetime) -> [str]:
     payload = {
         'fan_id' : _user_id,
         'count' : _count,
@@ -237,7 +248,7 @@ def fetch_items(_url : str, _user_id : str, _last_token : str, _count : int, _si
     with requests.post(
         _url,
         data = json.dumps(payload),
-        cookies = CONFIG['COOKIE_JAR'],
+        cookies = cookies,
     ) as response:
         response.raise_for_status()
         data = json.loads(response.text)
@@ -255,13 +266,13 @@ def fetch_items(_url : str, _user_id : str, _last_token : str, _count : int, _si
             items.append(data['redownload_urls'][item_type+item_id])
         return items
 
-def get_download_links_for_user(_user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
+def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
     print('Retrieving album links from user [{}]\'s collection.'.format(_user))
 
     soup = BeautifulSoup(
         requests.get(
             USER_URL.format(_user),
-            cookies = CONFIG['COOKIE_JAR']
+            cookies = cookies
         ).text,
         'html.parser',
         parse_only = SoupStrainer('div', id='pagedata'),
@@ -297,6 +308,7 @@ def get_download_links_for_user(_user : str, _include_hidden : bool, _since : da
     user_id = data['fan_data']['fan_id']
 
     download_urls.extend(fetch_items(
+        cookies,
         COLLECTION_POST_URL,
         user_id,
         data['collection_data']['last_token'],
@@ -306,6 +318,7 @@ def get_download_links_for_user(_user : str, _include_hidden : bool, _since : da
 
     if _include_hidden:
         download_urls.extend(fetch_items(
+            cookies,
             HIDDEN_POST_URL,
             user_id,
             data['hidden_data']['last_token'],
@@ -313,40 +326,43 @@ def get_download_links_for_user(_user : str, _include_hidden : bool, _since : da
             _since))
 
     return download_urls
+from requests.cookies import cookiejar_from_dict
 
-def download_album(_album_url : str, _attempt : int = 1) -> str:
+@ray.remote
+def download_album(_album_url : str, config: dict, _attempt : int = 1) -> str:
+    cookies = get_cookies()
     try:
         soup = BeautifulSoup(
             requests.get(
                 _album_url,
-                cookies = CONFIG['COOKIE_JAR']
+                cookies = cookies
             ).text,
             'html.parser',
             parse_only = SoupStrainer('div', id='pagedata'),
         )
         div = soup.find('div')
-        if not div:
-            CONFIG['TQDM'].write('ERROR: No div with pagedata found for album at url [{}]'.format(_album_url))
-            return
+        # if not div:
+        #     CONFIG['TQDM'].write('ERROR: No div with pagedata found for album at url [{}]'.format(_album_url))
+        #     return
 
         data = json.loads(html.unescape(div.get('data-blob')))
         album = data['download_items'][0]['title']
 
-        if not 'downloads' in data['download_items'][0]:
-            CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] has no downloads available.'.format(album, _album_url))
-            return
+        # if not 'downloads' in data['download_items'][0]:
+        #     CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] has no downloads available.'.format(album, _album_url))
+        #     return
 
-        if not CONFIG['FORMAT'] in data['download_items'][0]['downloads']:
-            CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] does not have a download for format [{}].'.format(album, _album_url, CONFIG['FORMAT']))
-            return
+        # if not CONFIG['FORMAT'] in data['download_items'][0]['downloads']:
+        #     CONFIG['TQDM'].write('WARN: Album [{}] at url [{}] does not have a download for format [{}].'.format(album, _album_url, CONFIG['FORMAT']))
+        #     return
 
-        download_url = data['download_items'][0]['downloads'][CONFIG['FORMAT']]['url']
+        download_url = data['download_items'][0]['downloads'][config['FORMAT']]['url']
         track_info = {key: data['download_items'][0][key] for key in TRACK_INFO_KEYS}
-        return download_file(download_url, track_info)
+        return download_file(config=config, _url=download_url, _track_info=track_info)
     except IOError as e:
-        if _attempt < CONFIG['MAX_URL_ATTEMPTS']:
-            if CONFIG['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the album at [{}]. Trying again...'.format(_attempt, _album_url))
-            time.sleep(CONFIG['URL_RETRY_WAIT'])
+        if _attempt < config['MAX_URL_ATTEMPTS']:
+            # if config['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the album at [{}]. Trying again...'.format(_attempt, _album_url))
+            time.sleep(config['URL_RETRY_WAIT'])
             download_album(_album_url, _attempt + 1)
         else:
             print_exception(e, 'An exception occurred trying to download album url [{}]:'.format(_album_url))
@@ -355,15 +371,15 @@ def download_album(_album_url : str, _attempt : int = 1) -> str:
     finally:
         # only tell TQDM we're done on the first call
         if _attempt == 1:
-            CONFIG['TQDM'].update()
-            time.sleep(CONFIG['POST_DOWNLOAD_WAIT'])
+            # CONFIG['TQDM'].update()
+            time.sleep(config['POST_DOWNLOAD_WAIT'])
 
-def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> str:
+def download_file(config: dict, _url : str, _track_info : dict = None, _attempt : int = 1) -> str:
     """Return a string representing the absolute path to the file being downloaded"""
     try:
         with requests.get(
                 _url,
-                cookies = CONFIG['COOKIE_JAR'],
+                cookies = cookiejar_from_dict(config['COOKIES_DICT']),
                 stream = True,
         ) as response:
             response.raise_for_status()
@@ -376,21 +392,21 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
             safe_track_info = {
                 key: (sanitize_filename(value) if type(value) == str else value) for key, value in _track_info.items()
             } if _track_info else {}
-            filename = CONFIG['FILENAME_FORMAT'].format(**safe_track_info) + extension
-            file_path = os.path.join(CONFIG['OUTPUT_DIR'], filename)
+            filename = config['FILENAME_FORMAT'].format(**safe_track_info) + extension
+            file_path = os.path.join(config['OUTPUT_DIR'], filename)
             if os.path.exists(file_path):
-                if CONFIG['FORCE']:
-                    if CONFIG['VERBOSE']: CONFIG['TQDM'].write('--force flag was given. Overwriting existing file at [{}].'.format(file_path))
-                else:
+                # if CONFIG['FORCE']:
+                #     if CONFIG['VERBOSE']: CONFIG['TQDM'].write('--force flag was given. Overwriting existing file at [{}].'.format(file_path))
+                # else:
                     actual_size = os.stat(file_path).st_size
                     if expected_size == actual_size:
-                        if CONFIG['VERBOSE'] >= 3: CONFIG['TQDM'].write('Skipping album that already exists: [{}]'.format(file_path))
+                        # if CONFIG['VERBOSE'] >= 3: CONFIG['TQDM'].write('Skipping album that already exists: [{}]'.format(file_path))
                         return file_path
-                    else:
-                        if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album at [{}] is the wrong size. Expected [{}] but was [{}]. Re-downloading.'.format(file_path, expected_size, actual_size))
+                    # else:
+                    #     if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album at [{}] is the wrong size. Expected [{}] but was [{}]. Re-downloading.'.format(file_path, expected_size, actual_size))
 
-            if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album being saved to [{}]'.format(file_path))
-            if CONFIG['DRY_RUN']:
+            # if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album being saved to [{}]'.format(file_path))
+            if config['DRY_RUN']:
                 return file_path
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             with open(file_path, 'wb') as fh:
@@ -400,10 +416,10 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
             if expected_size != actual_size:
                 raise IOError('Incomplete read. {} bytes read, {} bytes expected'.format(actual_size, expected_size))
     except IOError as e:
-        if _attempt < CONFIG['MAX_URL_ATTEMPTS']:
-            if CONFIG['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the file at [{}]. Trying again...'.format(_attempt, _url))
-            time.sleep(CONFIG['URL_RETRY_WAIT'])
-            download_file(_url, _track_info, _attempt + 1)
+        if _attempt < config['MAX_URL_ATTEMPTS']:
+            # if CONFIG['VERBOSE'] >=2: CONFIG['TQDM'].write('WARN: I/O Error on attempt # [{}] to download the file at [{}]. Trying again...'.format(_attempt, _url))
+            time.sleep(config['URL_RETRY_WAIT'])
+            download_file(config=config, _url=_url, _track_info=_track_info, _attempt=_attempt + 1)
         else:
             print_exception(e, 'An exception occurred trying to download file url [{}]:'.format(_url))
     except Exception as e:
@@ -411,9 +427,10 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
     return file_path
 
 def print_exception(_e : Exception, _msg : str = '') -> None:
-    CONFIG['TQDM'].write('\nERROR: {}'.format(_msg))
-    CONFIG['TQDM'].write('\n'.join(traceback.format_exception(etype=type(_e), value=_e , tb=_e.__traceback__)))
-    CONFIG['TQDM'].write('\n')
+    pass
+    # CONFIG['TQDM'].write('\nERROR: {}'.format(_msg))
+    # CONFIG['TQDM'].write('\n'.join(traceback.format_exception(etype=type(_e), value=_e , tb=_e.__traceback__)))
+    # CONFIG['TQDM'].write('\n')
 
 
 # Windows has some picky requirements about file names
@@ -456,8 +473,32 @@ def get_cookies():
 
 def _is_zip(file_path: str) -> bool:
     # Determine if the file is a compressed .zip archive
-    return file_path.endswith('.zip')
+    print(f'Checking if [{file_path}] is a zip file...')
+    try:
+        zipfile.is_zipfile(file_path)
+    except Exception as e:
+        print(f'Error checking if [{file_path}] is a zip file: {e}')
+        return False
+    return zipfile.is_zipfile(file_path)
 
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+# def cookiejar_to_set(cookiejar):
+#     return set(
+#         (cookie.name, cookie.value, cookie.domain, cookie.path, cookie.secure, cookie.expires)
+#         for cookie in cookiejar
+#     )
+#
+# diff_added = cookiejar_to_set(cookies) - cookiejar_to_set(CONFIG['COOKIE_JAR'])
+# diff_removed = cookiejar_to_set(CONFIG['COOKIE_JAR']) - cookiejar_to_set(cookies)
+#
+# print("=================Added cookies=====================")
+# for cookie in diff_added:
+#     print(cookie)
+#
+# print("\n==================Removed cookies===================")
+# for cookie in diff_removed:
+#     print(cookie)

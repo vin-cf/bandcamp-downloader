@@ -16,6 +16,7 @@ pyaes==1.6.1
 pycparser==2.21
 pycryptodome==3.20.0
 requests==2.31.0
+ray==2.48.0
 SecretStorage==3.3.3
 soupsieve==2.5
 tqdm==4.66.2
