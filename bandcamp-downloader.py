@@ -189,6 +189,7 @@ def main() -> int:
     if CONFIG['VERBOSE']: print(args)
     if CONFIG['FORCE']: print('WARNING: --force flag set, existing files will be overwritten.')
 
+    cookies = get_cookies()
     config = {
         'FORMAT': CONFIG['FORMAT'],
         'OUTPUT_DIR': CONFIG['OUTPUT_DIR'],
@@ -201,8 +202,9 @@ def main() -> int:
         'DRY_RUN': CONFIG['DRY_RUN'],
         'VERBOSE': CONFIG['VERBOSE'],
         'SINCE': CONFIG['SINCE'],
+        'COOKIES_LIST': [(c.name, c.value, c.domain, c.path) for c in cookies],
     }
-    links = get_download_links_for_user(get_cookies(), args.username, args.include_hidden, CONFIG['SINCE'])
+    links = get_download_links_for_user(cookies, args.username, args.include_hidden, CONFIG['SINCE'])
     print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
     if not links:
         if config['SINCE'] is None:
@@ -253,10 +255,16 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
         'count' : _count,
         'older_than_token' : _last_token,
     }
+    headers = {
+        'Referer': USER_URL.format(''),
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type': 'application/json',
+    }
     with requests.post(
         _url,
         data = json.dumps(payload),
         cookies = cookies,
+        headers = headers,
     ) as response:
         response.raise_for_status()
         data = json.loads(response.text)
@@ -265,12 +273,17 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
         if not data.get('items'):
             return []
 
+        redownload_urls = data.get('redownload_urls', {})
         eligible = data['items'] if _since is None else filter_by_purchase_time(data['items'], _since)
         results = []
         for item in eligible:
-            if item.get('download_available') and item.get('sale_item_id'):
+            if not item.get('download_available'):
+                continue
+            item_key = str(item.get('sale_item_type', '')) + str(item.get('sale_item_id', ''))
+            url = redownload_urls.get(item_key)
+            if url:
                 results.append({
-                    'url': 'https://bandcamp.com/download?from=collection&payment_id={}'.format(item['sale_item_id']),
+                    'url': url,
                     'title': item.get('item_title', ''),
                     'artist': item.get('band_name', ''),
                 })
@@ -332,11 +345,17 @@ def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _s
             _since))
 
     return download_urls
-from requests.cookies import cookiejar_from_dict
+from requests.cookies import RequestsCookieJar
+
+def _make_cookie_jar(config):
+    jar = RequestsCookieJar()
+    for name, value, domain, path in config['COOKIES_LIST']:
+        jar.set(name, value, domain=domain, path=path)
+    return jar
 
 @ray.remote
 def download_album(_album_url : str, config: dict, _attempt : int = 1) -> str:
-    cookies = get_cookies()
+    cookies = _make_cookie_jar(config)
     try:
         soup = BeautifulSoup(
             requests.get(
@@ -347,9 +366,9 @@ def download_album(_album_url : str, config: dict, _attempt : int = 1) -> str:
             parse_only = SoupStrainer('div', id='pagedata'),
         )
         div = soup.find('div')
-        # if not div:
-        #     CONFIG['TQDM'].write('ERROR: No div with pagedata found for album at url [{}]'.format(_album_url))
-        #     return
+        if not div:
+            print('ERROR: No pagedata div found for album at url [{}]'.format(_album_url))
+            return
 
         data = json.loads(html.unescape(div.get('data-blob')))
         album = data['download_items'][0]['title']
@@ -385,7 +404,7 @@ def download_file(config: dict, _url : str, _track_info : dict = None, _attempt 
     try:
         with requests.get(
                 _url,
-                cookies = cookiejar_from_dict(config['COOKIES_DICT']),
+                cookies = _make_cookie_jar(config),
                 stream = True,
         ) as response:
             response.raise_for_status()
@@ -433,10 +452,8 @@ def download_file(config: dict, _url : str, _track_info : dict = None, _attempt 
     return file_path
 
 def print_exception(_e : Exception, _msg : str = '') -> None:
-    pass
-    # CONFIG['TQDM'].write('\nERROR: {}'.format(_msg))
-    # CONFIG['TQDM'].write('\n'.join(traceback.format_exception(etype=type(_e), value=_e , tb=_e.__traceback__)))
-    # CONFIG['TQDM'].write('\n')
+    print('\nERROR: {}'.format(_msg))
+    print('\n'.join(traceback.format_exception(_e)))
 
 
 # Windows has some picky requirements about file names
@@ -458,29 +475,18 @@ def sanitize_filename(_path : str) -> str:
 
 def _load_sqlite_cookies(sqlite_path):
     """Read cookies directly from a Firefox/LibreWolf cookies.sqlite file."""
-    cj = http.cookiejar.CookieJar()
+    jar = RequestsCookieJar()
     con = sqlite3.connect(f'file:{sqlite_path}?mode=ro&immutable=1', uri=True)
     try:
         cur = con.execute(
-            "SELECT host, path, name, value, expiry, isSecure, isHttpOnly "
-            "FROM moz_cookies WHERE host LIKE '%bandcamp.com%'"
+            "SELECT host, path, name, value "
+            "FROM moz_cookies WHERE host LIKE '%bandcamp.com%' AND name NOT LIKE '_comm_%'"
         )
-        for host, path, name, value, expiry, secure, http_only in cur.fetchall():
-            cookie = http.cookiejar.Cookie(
-                version=0, name=name, value=value,
-                port=None, port_specified=False,
-                domain=host, domain_specified=bool(host), domain_initial_dot=host.startswith('.'),
-                path=path, path_specified=bool(path),
-                secure=bool(secure),
-                expires=expiry,
-                discard=False,
-                comment=None, comment_url=None,
-                rest={'HttpOnly': ''} if http_only else {},
-            )
-            cj.set_cookie(cookie)
+        for host, path, name, value in cur.fetchall():
+            jar.set(name, value, domain=host, path=path)
     finally:
         con.close()
-    return cj
+    return jar
 
 def get_cookies():
     if CONFIG['COOKIES']:
