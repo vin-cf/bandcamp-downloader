@@ -256,29 +256,15 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
         data = json.loads(response.text)
 
         # There might be no data, for example calling `--include-hidden` with no hidden items
-        print(f'DEBUG fetch_items token={_last_token!r}: keys={list(data.keys())}, items={len(data.get("items",[]))}, urls={len(data.get("redownload_urls",{}))}')
-        if data.get('items'):
-            sample = data['items'][0]
-            print(f'DEBUG sample item keys: {list(sample.keys())}')
-        if data.get('item_lookup'):
-            sample_key = next(iter(data['item_lookup']))
-            print(f'DEBUG item_lookup sample key={sample_key!r} value={data["item_lookup"][sample_key]}')
-        if data.get('purchase_infos'):
-            sample_key = next(iter(data['purchase_infos']))
-            print(f'DEBUG purchase_infos sample key={sample_key!r} value={data["purchase_infos"][sample_key]}')
-        if 'redownload_urls' not in data:
+        if not data.get('items'):
             return []
 
-        if _since is None:
-            return data['redownload_urls'].values()
-        items = []
-        for item in filter_by_purchase_time(data['items'], _since):
-            item_id = str(item['sale_item_id'])
-            item_type = item['sale_item_type']
-            key = item_type + item_id
-            if key in data['redownload_urls']:
-                items.append(data['redownload_urls'][key])
-        return items
+        eligible = data['items'] if _since is None else filter_by_purchase_time(data['items'], _since)
+        urls = []
+        for item in eligible:
+            if item.get('download_available') and item.get('sale_item_id'):
+                urls.append('https://bandcamp.com/download?from=collection&payment_id={}'.format(item['sale_item_id']))
+        return urls
 
 def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
     print('Retrieving album links from user [{}]\'s collection.'.format(_user))
@@ -295,7 +281,6 @@ def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _s
     div = soup.find('div')
     if not div:
         print('ERROR: No div with pagedata found for user at url [{}]'.format(USER_URL.format(_user)))
-        print(f'DEBUG: HTTP status={response.status_code}, response snippet:\n{response.text[:500]}')
         return
     data = json.loads(html.unescape(div.get('data-blob')))
     if 'collection_count' not in data:
