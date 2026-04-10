@@ -5,9 +5,11 @@ import datetime
 import glob
 import html
 import http
+import http.cookiejar
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import urllib.parse
@@ -21,7 +23,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 import requests
 import browser_cookie3
 import ray
-from setuptools.command.build_ext import if_dl
+# from setuptools.command.build_ext import if_dl
 # from tqdm import tqdm
 
 USER_URL = 'https://bandcamp.com/{}'
@@ -254,6 +256,16 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
         data = json.loads(response.text)
 
         # There might be no data, for example calling `--include-hidden` with no hidden items
+        print(f'DEBUG fetch_items token={_last_token!r}: keys={list(data.keys())}, items={len(data.get("items",[]))}, urls={len(data.get("redownload_urls",{}))}')
+        if data.get('items'):
+            sample = data['items'][0]
+            print(f'DEBUG sample item keys: {list(sample.keys())}')
+        if data.get('item_lookup'):
+            sample_key = next(iter(data['item_lookup']))
+            print(f'DEBUG item_lookup sample key={sample_key!r} value={data["item_lookup"][sample_key]}')
+        if data.get('purchase_infos'):
+            sample_key = next(iter(data['purchase_infos']))
+            print(f'DEBUG purchase_infos sample key={sample_key!r} value={data["purchase_infos"][sample_key]}')
         if 'redownload_urls' not in data:
             return []
 
@@ -263,23 +275,27 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
         for item in filter_by_purchase_time(data['items'], _since):
             item_id = str(item['sale_item_id'])
             item_type = item['sale_item_type']
-            items.append(data['redownload_urls'][item_type+item_id])
+            key = item_type + item_id
+            if key in data['redownload_urls']:
+                items.append(data['redownload_urls'][key])
         return items
 
 def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
     print('Retrieving album links from user [{}]\'s collection.'.format(_user))
 
+    response = requests.get(
+        USER_URL.format(_user),
+        cookies = cookies
+    )
     soup = BeautifulSoup(
-        requests.get(
-            USER_URL.format(_user),
-            cookies = cookies
-        ).text,
+        response.text,
         'html.parser',
         parse_only = SoupStrainer('div', id='pagedata'),
     )
     div = soup.find('div')
     if not div:
         print('ERROR: No div with pagedata found for user at url [{}]'.format(USER_URL.format(_user)))
+        print(f'DEBUG: HTTP status={response.status_code}, response snippet:\n{response.text[:500]}')
         return
     data = json.loads(html.unescape(div.get('data-blob')))
     if 'collection_count' not in data:
@@ -288,24 +304,19 @@ def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _s
         ))
         exit(2)
 
-    # The collection_data.redownload_urls includes links for both hidden and
-    # unhidden items. The unhidden items all appear before the hidden items in
-    # the raw json response, so in python 3.7+ we can probably expect that this
-    # ordering carries through to the keys of redownload_urls and just truncate
-    # the list... but this is a little uncomfortable to rely on, so let's divide
-    # them up by explicitly checking item_cache.
-    items = list(data['item_cache']['collection'].values())
-    if _include_hidden:
-        items.extend(data['item_cache']['hidden'].values())
-    if _since:
-        items = filter_by_purchase_time(items, _since)
-    item_keys = [str(item['sale_item_type']) + str(item['sale_item_id'])
-                 for item in items
-                 if 'sale_item_type' in item and 'sale_item_id' in item]
-    all_urls = data['collection_data']['redownload_urls']
-    download_urls = [all_urls[key] for key in item_keys if key in all_urls]
-
     user_id = data['fan_data']['fan_id']
+    batch_size = data['collection_data'].get('batch_size', 20)
+
+    # Bandcamp no longer includes redownload_urls in the initial page blob.
+    # Fetch the first batch via the paginated API using a far-future token so
+    # it covers the newest items (which are in item_cache but have no urls).
+    download_urls = list(fetch_items(
+        cookies,
+        COLLECTION_POST_URL,
+        user_id,
+        '9999999999:0:t::',
+        batch_size,
+        _since))
 
     download_urls.extend(fetch_items(
         cookies,
@@ -450,6 +461,32 @@ def sanitize_filename(_path : str) -> str:
         # Remove `/`
         return _path.replace('/', '-')
 
+def _load_sqlite_cookies(sqlite_path):
+    """Read cookies directly from a Firefox/LibreWolf cookies.sqlite file."""
+    cj = http.cookiejar.CookieJar()
+    con = sqlite3.connect(f'file:{sqlite_path}?mode=ro&immutable=1', uri=True)
+    try:
+        cur = con.execute(
+            "SELECT host, path, name, value, expiry, isSecure, isHttpOnly "
+            "FROM moz_cookies WHERE host LIKE '%bandcamp.com%'"
+        )
+        for host, path, name, value, expiry, secure, http_only in cur.fetchall():
+            cookie = http.cookiejar.Cookie(
+                version=0, name=name, value=value,
+                port=None, port_specified=False,
+                domain=host, domain_specified=bool(host), domain_initial_dot=host.startswith('.'),
+                path=path, path_specified=bool(path),
+                secure=bool(secure),
+                expires=expiry,
+                discard=False,
+                comment=None, comment_url=None,
+                rest={'HttpOnly': ''} if http_only else {},
+            )
+            cj.set_cookie(cookie)
+    finally:
+        con.close()
+    return cj
+
 def get_cookies():
     if CONFIG['COOKIES']:
         # First try it as a mozilla cookie jar
@@ -459,7 +496,12 @@ def get_cookies():
             return cj
         except Exception as e:
             if CONFIG['VERBOSE'] >=2: print(f"Cookie file at [{CONFIG['COOKIES']}] not a mozilla cookie jar.\nTrying it as a cookie store for the browser [{CONFIG['BROWSER']}]...")
-        # Next try it with browser_cookie
+        # Try reading it directly as a Firefox/LibreWolf SQLite cookie store
+        try:
+            return _load_sqlite_cookies(CONFIG['COOKIES'])
+        except Exception:
+            pass
+        # Fall back to browser_cookie3
         try:
             func = getattr(browser_cookie3, CONFIG['BROWSER'])
             return func(domain_name = 'bandcamp.com', cookie_file = CONFIG['COOKIES'])
