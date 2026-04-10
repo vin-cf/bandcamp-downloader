@@ -203,7 +203,7 @@ def main() -> int:
         'SINCE': CONFIG['SINCE'],
     }
     links = get_download_links_for_user(get_cookies(), args.username, args.include_hidden, CONFIG['SINCE'])
-    if config['VERBOSE']: print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
+    print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
     if not links:
         if config['SINCE'] is None:
             print('WARN: No album links found for user [{}]. Are you logged in and have you selected the correct browser to pull cookies from?'.format(args.username))
@@ -211,12 +211,18 @@ def main() -> int:
             print('WARN: No album links found for user [{}] since [{}]. Are you logged in and have you selected the correct browser to pull cookies from, and is the specified time old enough?'.format(args.username, args.download_since))
         sys.exit(2)
 
+    if config['DRY_RUN']:
+        for item in links:
+            print('{} - {}'.format(item['artist'], item['title']))
+        return
+
     print('Starting album downloads...')
+
     downloaded_zips = []
     # CONFIG['TQDM'] = tqdm(links, unit = 'album')
 
 
-    futures = [download_album.remote( link, config) for link in links]
+    futures = [download_album.remote(item['url'], config) for item in links]
     [downloaded_zips.append(file_path) for file_path in ray.get(futures) if file_path and _is_zip(file_path)]
     # CONFIG['TQDM'].close()
     print(downloaded_zips)
@@ -260,11 +266,15 @@ def fetch_items(cookies, _url : str, _user_id : str, _last_token : str, _count :
             return []
 
         eligible = data['items'] if _since is None else filter_by_purchase_time(data['items'], _since)
-        urls = []
+        results = []
         for item in eligible:
             if item.get('download_available') and item.get('sale_item_id'):
-                urls.append('https://bandcamp.com/download?from=collection&payment_id={}'.format(item['sale_item_id']))
-        return urls
+                results.append({
+                    'url': 'https://bandcamp.com/download?from=collection&payment_id={}'.format(item['sale_item_id']),
+                    'title': item.get('item_title', ''),
+                    'artist': item.get('band_name', ''),
+                })
+        return results
 
 def get_download_links_for_user(cookies, _user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
     print('Retrieving album links from user [{}]\'s collection.'.format(_user))
