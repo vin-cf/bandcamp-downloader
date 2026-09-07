@@ -417,7 +417,7 @@ def download_file(config: dict, _url : str, _track_info : dict = None, _attempt 
             safe_track_info = {
                 key: (sanitize_filename(value) if type(value) == str else value) for key, value in _track_info.items()
             } if _track_info else {}
-            filename = config['FILENAME_FORMAT'].format(**safe_track_info) + extension
+            filename = _truncate_path_components(config['FILENAME_FORMAT'].format(**safe_track_info) + extension)
             file_path = os.path.join(config['OUTPUT_DIR'], filename)
             if os.path.exists(file_path):
                 # if CONFIG['FORCE']:
@@ -472,6 +472,29 @@ def sanitize_filename(_path : str) -> str:
     else:
         # Remove `/`
         return _path.replace('/', '-')
+
+def _truncate_filename_component(_component : str, _max_bytes : int = 255) -> str:
+    """Truncate a single path component so its UTF-8 encoding fits within _max_bytes bytes,
+    without splitting a multi-byte character and preserving the file extension."""
+    encoded = _component.encode('utf-8')
+    if len(encoded) <= _max_bytes:
+        return _component
+    root, ext = os.path.splitext(_component)
+    ext_bytes = len(ext.encode('utf-8'))
+    budget = _max_bytes - ext_bytes
+    if budget < 1:
+        budget = 1
+    root = root.encode('utf-8')[:budget].decode('utf-8', errors='ignore')
+    return root + ext
+
+def _truncate_path_components(_path : str, _max_bytes : int = 255) -> str:
+    """Truncate every path component of _path to fit within _max_bytes bytes each,
+    so the resulting path never exceeds the filesystem's per-component name limit."""
+    parts = re.split(r'([/\\])', _path)
+    return ''.join(
+        _truncate_filename_component(part, _max_bytes) if part not in ('/', '\\') else part
+        for part in parts
+    )
 
 def _load_sqlite_cookies(sqlite_path):
     """Read cookies directly from a Firefox/LibreWolf cookies.sqlite file."""
